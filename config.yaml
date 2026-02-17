@@ -19,10 +19,10 @@ servers:
         methods: ["GET"]
         index: "index.html"
 
-      - path: "/uploads"
-        root: "./www/uploads"
-        methods: ["POST", "DELETE"]
-        client_max_body_size: 5000000
+      - path: "/upload"
+        root: "./www"
+        methods: ["GET", "POST"]
+        upload_dir: "./www/uploads"
 
       - path: "/old-site"
         redirect: "/new-site"

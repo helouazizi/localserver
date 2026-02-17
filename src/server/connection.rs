@@ -1,15 +1,16 @@
 use std::time::Instant;
+use mio::net::TcpStream;
 
-// src/server/connection.rs
+#[derive(Debug, PartialEq)]
 pub enum ConnectionState {
     ReadRequest,
     WriteResponse,
-    Closing,
-    
+    // Closing,
 }
 
 pub struct Connection {
-    pub fd: i32,
+    pub stream: TcpStream,
+
     pub state: ConnectionState,
     pub read_buffer: Vec<u8>,
     pub write_buffer: Vec<u8>,
@@ -17,13 +18,12 @@ pub struct Connection {
     pub last_activity: Instant,
     pub server_idx: usize,
     pub request_complete: bool,
-    
 }
 
 impl Connection {
-    pub fn new(fd: i32, server_idx: usize) -> Self {
+    pub fn new(stream: TcpStream, server_idx: usize) -> Self {
         Self {
-            fd,
+            stream,
             state: ConnectionState::ReadRequest,
             read_buffer: Vec::with_capacity(8192),
             write_buffer: Vec::new(),
@@ -33,4 +33,14 @@ impl Connection {
             request_complete: false,
         }
     }
+
+    // i will implememt keep alive logic
+    // pub fn reset_for_next_request(&mut self) {
+    //     self.read_buffer.clear();
+    //     self.write_buffer.clear();
+    //     self.bytes_written = 0;
+    //     self.request_complete = false;
+    //     self.state = ConnectionState::ReadRequest;
+    //     self.last_activity = Instant::now();
+    // }
 }
