@@ -9,9 +9,7 @@ pub struct HttpRequest {
 
 #[derive(Debug)]
 pub struct UploadedFile {
-    pub field_name: String,
     pub file_name: String,
-    pub content_type: String,
     pub data: Vec<u8>,
 }
 
@@ -20,7 +18,6 @@ pub struct MultipartForm {
 }
 
 impl HttpRequest {
-
     pub fn parse(raw_data: &[u8]) -> Option<Self> {
         let header_end = Self::find_header_end(raw_data)?;
         let header_bytes = &raw_data[..header_end];
@@ -111,7 +108,6 @@ impl HttpRequest {
                 } // End of multipart
             };
 
-
             let part_data = &body[part_search_start..end_pos];
             if let Some(file) = Self::parse_multipart_part(part_data) {
                 files.push(file);
@@ -137,19 +133,8 @@ impl HttpRequest {
 
         let header_str = std::str::from_utf8(header_bytes).ok()?;
         let mut file_name = String::new();
-        let mut field_name = String::new();
-        let mut content_type = String::new();
-
         for line in header_str.lines() {
             if line.to_lowercase().starts_with("content-disposition:") {
-                if
-                    let Some(n) = line
-                        .split("name=\"")
-                        .nth(1)
-                        .and_then(|s| s.split('"').next())
-                {
-                    field_name = n.to_string();
-                }
                 if
                     let Some(f) = line
                         .split("filename=\"")
@@ -159,9 +144,6 @@ impl HttpRequest {
                     file_name = f.to_string();
                 }
             }
-            if line.to_lowercase().starts_with("content-type:") {
-                content_type = line.split(':').nth(1)?.trim().to_string();
-            }
         }
 
         if file_name.is_empty() {
@@ -169,9 +151,7 @@ impl HttpRequest {
         }
 
         Some(UploadedFile {
-            field_name,
             file_name,
-            content_type,
             data: actual_file_data.to_vec(),
         })
     }

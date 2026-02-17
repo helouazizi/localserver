@@ -4,6 +4,7 @@ use mio::net::TcpStream;
 #[derive(Debug, PartialEq)]
 pub enum ConnectionState {
     ReadRequest,
+    CgiPending,
     WriteResponse,
     // Closing,
 }

@@ -1,6 +1,8 @@
+#[derive(Clone)]
 pub struct RouteConfig {
     pub path: String,
     pub root: String,
+    pub upload_dir: Option<String>,
     pub methods: Vec<String>,
     pub index: Option<String>,
     pub autoindex: bool,

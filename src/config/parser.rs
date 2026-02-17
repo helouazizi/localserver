@@ -154,6 +154,9 @@ fn apply_route_field(route: &mut RouteConfig, key: &str, value: &str) {
         "root" => {
             route.root = value.to_string();
         }
+        "upload_dir" => {
+            route.upload_dir = Some(value.to_string());
+        }
         "index" => {
             route.index = Some(value.to_string());
         }
@@ -207,6 +210,7 @@ fn default_route() -> RouteConfig {
     RouteConfig {
         path: "/".to_string(),
         root: "./www".to_string(),
+        upload_dir: None,
         methods: Vec::new(),
         index: None,
         autoindex: false,
