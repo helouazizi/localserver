@@ -35,13 +35,5 @@ impl Connection {
         }
     }
 
-    // i will implememt keep alive logic
-    // pub fn reset_for_next_request(&mut self) {
-    //     self.read_buffer.clear();
-    //     self.write_buffer.clear();
-    //     self.bytes_written = 0;
-    //     self.request_complete = false;
-    //     self.state = ConnectionState::ReadRequest;
-    //     self.last_activity = Instant::now();
-    // }
+
 }
