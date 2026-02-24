@@ -6,7 +6,6 @@ pub enum ConnectionState {
     ReadRequest,
     CgiPending,
     WriteResponse,
-    // Closing,
 }
 
 pub struct Connection {
