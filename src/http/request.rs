@@ -22,13 +22,6 @@ impl HttpRequest {
         let header_end = Self::find_header_end(raw_data)?;
         let header_bytes = &raw_data[..header_end];
 
-        let content_length = Self::get_content_length(header_bytes).unwrap_or(0);
-        let current_body_len = raw_data.len() - header_end;
-
-        if current_body_len < content_length {
-            return None;
-        }
-
         let header_str = std::str::from_utf8(header_bytes).ok()?;
         let mut lines = header_str.split("\r\n");
 
@@ -47,7 +40,17 @@ impl HttpRequest {
             }
         }
 
-        let body = raw_data[header_end..header_end + content_length].to_vec();
+        let body_slice = &raw_data[header_end..];
+        let body = if Self::is_chunked_transfer(&headers) {
+            let (decoded, _) = Self::decode_chunked_body(body_slice)?;
+            decoded
+        } else {
+            let content_length = Self::get_content_length(header_bytes).unwrap_or(0);
+            if body_slice.len() < content_length {
+                return None;
+            }
+            body_slice[..content_length].to_vec()
+        };
 
         Some(HttpRequest {
             method,
@@ -59,9 +62,17 @@ impl HttpRequest {
 
     pub fn is_complete(buf: &[u8]) -> bool {
         if let Some(header_end) = Self::find_header_end(buf) {
-            let content_length = Self::get_content_length(&buf[..header_end]).unwrap_or(0);
-            let body_len = buf.len() - header_end;
-            return body_len >= content_length;
+            let header_bytes = &buf[..header_end];
+            let body_slice = &buf[header_end..];
+
+            if let Some(headers) = Self::parse_headers_map(header_bytes) {
+                if Self::is_chunked_transfer(&headers) {
+                    return Self::decode_chunked_body(body_slice).is_some();
+                }
+            }
+
+            let content_length = Self::get_content_length(header_bytes).unwrap_or(0);
+            return body_slice.len() >= content_length;
         }
         false
     }
@@ -83,10 +94,74 @@ impl HttpRequest {
         None
     }
 
+    fn parse_headers_map(header_bytes: &[u8]) -> Option<HashMap<String, String>> {
+        let header_str = std::str::from_utf8(header_bytes).ok()?;
+        let mut lines = header_str.split("\r\n");
+        let _ = lines.next()?;
+
+        let mut headers = HashMap::new();
+        for line in lines {
+            if line.is_empty() {
+                break;
+            }
+            if let Some((key, val)) = line.split_once(':') {
+                headers.insert(key.trim().to_lowercase(), val.trim().to_string());
+            }
+        }
+        Some(headers)
+    }
+
+    fn is_chunked_transfer(headers: &HashMap<String, String>) -> bool {
+        headers
+            .get("transfer-encoding")
+            .map(|v| { v.split(',').any(|part| part.trim().eq_ignore_ascii_case("chunked")) })
+            .unwrap_or(false)
+    }
+
+    fn decode_chunked_body(body: &[u8]) -> Option<(Vec<u8>, usize)> {
+        let mut decoded = Vec::new();
+        let mut pos = 0usize;
+
+        loop {
+            let line_end_rel = body
+                .get(pos..)?
+                .windows(2)
+                .position(|w| w == b"\r\n")?;
+            let line_end = pos + line_end_rel;
+            let size_line = std::str::from_utf8(&body[pos..line_end]).ok()?;
+            let size_hex = size_line.split(';').next()?.trim();
+            let chunk_size = usize::from_str_radix(size_hex, 16).ok()?;
+            pos = line_end + 2;
+
+            if chunk_size == 0 {
+                let trailers = body.get(pos..)?;
+                if trailers.starts_with(b"\r\n") {
+                    pos += 2;
+                    return Some((decoded, pos));
+                }
+
+                let trailer_end = trailers.windows(4).position(|w| w == b"\r\n\r\n")?;
+                pos += trailer_end + 4;
+                return Some((decoded, pos));
+            }
+
+            if body.len() < pos + chunk_size + 2 {
+                return None;
+            }
+
+            decoded.extend_from_slice(&body[pos..pos + chunk_size]);
+            pos += chunk_size;
+
+            if &body[pos..pos + 2] != b"\r\n" {
+                return None;
+            }
+            pos += 2;
+        }
+    }
+
     pub fn parse_multipart(
         headers: &HashMap<String, String>,
-        body: &[u8]
-    ) -> Option<MultipartForm> {
+        body: &[u8]) -> Option<MultipartForm> {
         let content_type = headers.get("content-type")?;
         if !content_type.contains("multipart/form-data") {
             return None;

@@ -1,68 +1,115 @@
 # localserver
 
+`localserver` is a custom HTTP/1.1 web server written in Rust.
 
-This is a significant systems programming challenge. Building a high-performance, non-blocking, single-threaded web server in Rust without using tokio or nix requires a deep understanding of the Linux epoll API and the HTTP/1.1 protocol.
-***
+It runs in a single process and single thread, using a non-blocking event loop based on `mio`.
 
-Given the scope, I will provide a robust structural foundation, the core event loop using libc and epoll, and the architectural pattern for separation of concerns.
+## Features
+
+- Event-driven non-blocking I/O (`mio`)
+- Multi-listener setup (multiple server blocks)
+- Static file serving
+- CGI execution (configured by extension/interpreter)
+- File uploads (raw and multipart)
+- Chunked + unchunked request body handling
+- Route method control (`GET`, `POST`, `DELETE`)
+- Route redirections
+- Directory index file + autoindex listing
+- Host-based virtual server selection (`Host` header)
+- Custom error pages + fallback HTML
+- Client body-size and timeout limits
+- Basic cookie/session support (`SESSION_ID`)
 
 ## Project Structure
-```
+
+```text
 .
-├── Cargo.toml            # Rust project manifest
+├── Cargo.toml
+├── config.yaml
 ├── src/
-│   ├── main.rs           # Application entry point
-│   ├── config/           # Configuration parsing and validation
-│   ├── network/          # Epoll abstraction and low-level socket handling
-│   ├── http/             # HTTP request/response models and parsing logic
-│   ├── server/           # Core reactor, event loop, and state management
-│   └── handlers/         # Routing, static file serving, and CGI handling
-└── www/                  # Public web root (static assets)
+│   ├── main.rs
+│   ├── config/
+│   │   ├── mod.rs
+│   │   ├── models.rs
+│   │   └── parser.rs
+│   ├── handlers/
+│   │   ├── mod.rs
+│   │   └── cgi.rs
+│   ├── http/
+│   │   ├── mod.rs
+│   │   └── request.rs
+│   └── server/
+│       ├── connection.rs
+│       └── mod.rs
+├── tests/
+│   └── audit_smoke.sh
+└── www/
 ```
 
+## Requirements
 
-1. Cargo.toml
-We only use libc for system calls.
-```gargo.toml```
+- Rust (edition 2024)
+- Cargo
 
-2. The Core: Non-blocking Epoll Wrapper
-This handles the low-level OS event notifications.
-``` src/network/poll.rs```
+## Build and Run
 
-3. Connection State Management
-Since we are single-threaded and non-blocking, we must store the "state" of every client (buffers, partial requests).
-```src/server/connection.rs```
-4. The Server Reactor
-This coordinates the listening sockets and client connections.
-```src/server/mod.rs```
+```bash
+cargo check
+cargo run
+```
 
-5. HTTP Parser Concept
-You should implement a simple state machine to parse the request header line by line.
-```src/http/request.rs```
+Server loads configuration from `config.yaml`.
 
-6. CGI Handling
-Since you are allowed to fork, here is how you separate the CGI concern.
-```src/handlers/cgi.rs```
+## Configuration Overview
 
+Top-level:
 
-### Key Implementation Guidelines to meet requirements:
+- `max_server_size`
+- `timeout_seconds`
+- `servers`
 
-1.  **Non-Blocking Sockets**: When you `accept` a connection or create a listener, you must set the O_NONBLOCK flag using `fcntl`.
-    ```rust
-    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL, 0) };
-    unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
-    ```
-2.  **Edge-Triggered (EPOLLET)**: Use Edge-Triggered mode for epoll. This means you must read until `EAGAIN` or `EWOULDBLOCK`.
-3.  **Chunked Requests**: You need a specific parser state that reads the hex size, then reads that many bytes, then repeats until a size of 0.
-4.  **Configuration**: Create a `Config` struct. Parse the file into a `Vec<ServerBlock>`. Each `ServerBlock` contains `Route` objects.
-5.  **Memory Management**: Because you are using `libc` and `unsafe`, ensure you are not leaking file descriptors. Every `fd` added to epoll must eventually be `close()`ed. Rust's `Drop` trait on a wrapper struct is your friend here.
+Per server:
 
-### How to approach the CGI requirement
-The prompt says you can't use `tokio`, but you can `fork`. However, since your server is single-threaded and non-blocking, a blocking `child.wait_with_output()` will freeze the whole server.
-*   **The Pro approach**: Use `libc::pipe` to create pipes for stdin/stdout, set them to non-blocking, add the pipe's FD to your `epoll` loop. When the pipe is ready to read, collect the CGI output asynchronously.
+- `host`
+- `port`
+- `server_name`
+- `max_body_size`
+- `error_pages`
+- `routes`
 
-### Memory Leak Prevention
-*   Run your server under `valgrind` or use the `heaptrack` tool.
-*   Since you are avoiding threads, you don't need to worry about data races, but be careful with `unsafe` blocks when converting between raw pointers and Rust slices.
+Per route:
 
-This structure provides the "Separation of Concerns" requested: `Poller` handles OS interaction, `Server` handles logic/flow, `Request/Response` handles protocol, and `Handlers` handle the actual content.
+- `path`
+- `root`
+- `methods`
+- `index`
+- `autoindex`
+- `redirect`
+- `upload_dir`
+- `cgi_extension`
+- `cgi_interpreter`
+
+## Quick Validation
+
+Run smoke tests:
+
+```bash
+./tests/audit_smoke.sh
+```
+
+The script checks:
+
+- `GET /`
+- `POST /upload`
+- `GET /upload/<file>` and `GET /uploads/<file>`
+- `DELETE /upload/<file>`
+- Redirect behavior
+- Chunked upload
+- Session cookie issuance
+- Host-header virtual server request
+
+## Notes
+
+- No async runtime/framework is used (`tokio`, `hyper`, `axum`, etc.).
+- The code is intentionally modular: config parsing, request parsing, CGI, and server loop are separated.
+- For stress evidence (availability target), run your own benchmark (e.g. `siege`) and keep the output as audit proof.

@@ -4,7 +4,7 @@ use crate::handlers::cgi::spawn_cgi_process;
 use crate::server::connection::{ Connection, ConnectionState };
 
 use mio::net::{ TcpListener };
-use mio::unix::SourceFd;
+use mio::unix::{ pipe::Receiver, SourceFd };
 use mio::{ Interest, Poll, Token };
 use std::collections::HashMap;
 use std::io::{ self, Read, Write };
@@ -12,6 +12,7 @@ use std::os::fd::AsRawFd;
 use std::path::Path;
 use std::time::Duration;
 use std::time::Instant;
+use std::time::{ SystemTime, UNIX_EPOCH };
 
 const SERVER_TOKEN_MAX: usize = 100; // Assume max 100 server blocks
 
@@ -21,6 +22,8 @@ pub struct Server {
     connections: HashMap<Token, Connection>,
     pending_cgi: HashMap<Token, PendingCgi>,
     cgi_token_to_client: HashMap<Token, Token>,
+    sessions: HashMap<String, Instant>,
+    next_session_id: u64,
     config: Config,
     next_token: usize,
 }
@@ -32,7 +35,7 @@ struct ListenerEntry {
 
 struct PendingCgi {
     child: std::process::Child,
-    stdout: std::process::ChildStdout,
+    stdout: Receiver,
     output: Vec<u8>,
     io_token: Token,
     started_at: Instant,
@@ -46,16 +49,23 @@ impl Server {
             connections: HashMap::new(),
             pending_cgi: HashMap::new(),
             cgi_token_to_client: HashMap::new(),
+            sessions: HashMap::new(),
+            next_session_id: 1,
             config,
             next_token: SERVER_TOKEN_MAX,
         }
     }
 
     pub fn bind(&mut self) -> Result<(), String> {
+        let mut bound_addrs: HashMap<String, Token> = HashMap::new();
+
         for (idx, s_cfg) in self.config.servers.iter().enumerate() {
-            let addr = format!("{}:{}", s_cfg.host, s_cfg.port)
-                .parse()
-                .map_err(|e| format!("Invalid address: {}", e))?;
+            let addr_str = format!("{}:{}", s_cfg.host, s_cfg.port);
+            if bound_addrs.contains_key(&addr_str) {
+                continue;
+            }
+
+            let addr = addr_str.parse().map_err(|e| format!("Invalid address: {}", e))?;
 
             match TcpListener::bind(addr) {
                 Ok(mut listener) => {
@@ -70,6 +80,7 @@ impl Server {
                         listener,
                         server_idx: idx,
                     });
+                    bound_addrs.insert(addr_str.clone(), token);
                     println!("[Setup] Bound to http://{}", addr);
                 }
                 Err(e) => eprintln!("[Setup] Failed to bind {}: {}", addr, e),
@@ -260,7 +271,7 @@ impl Server {
 
     fn process_request(&mut self, token: Token) {
         // --- 1. DATA EXTRACTION ---
-        let (method, uri, headers, body, server_idx) = {
+        let (method, uri, headers, body, mut server_idx) = {
             let conn = match self.connections.get(&token) {
                 Some(c) => c,
                 None => {
@@ -285,6 +296,12 @@ impl Server {
             self.send_error(token, 400);
             return;
         }
+
+        server_idx = self.select_server_for_request(server_idx, &headers);
+        if let Some(conn) = self.connections.get_mut(&token) {
+            conn.server_idx = server_idx;
+        }
+        self.attach_session_cookie(token, &headers);
 
         let (path_only, query_string) = match uri.split_once('?') {
             Some((p, q)) => (p.to_string(), q.to_string()),
@@ -312,6 +329,11 @@ impl Server {
             }
         };
 
+        if let Some(target) = &route.redirect {
+            self.send_redirect_response(token, target, 301);
+            return;
+        }
+
         // --- 3. METHOD VALIDATION ---
         if !route.methods.contains(&method) && !route.methods.is_empty() {
             self.send_error(token, 405);
@@ -322,7 +344,7 @@ impl Server {
         // Rule: If it's POST/PUT and NOT a CGI script, treat it as an upload
         let is_cgi = route.cgi_extension.as_ref().map_or(false, |ext| path_only.ends_with(ext));
 
-        if (method == "POST" || method == "PUT") && !is_cgi {
+        if method == "POST" && !is_cgi {
             let upload_path = route.upload_dir
                 .as_ref()
                 .map(std::path::PathBuf::from)
@@ -356,12 +378,40 @@ impl Server {
         let mut full_path = std::path::PathBuf::from(&route.root);
         full_path.push(relative_path.trim_start_matches('/'));
 
+        if method == "DELETE" {
+            let delete_target = if let Some(upload_dir) = &route.upload_dir {
+                let rel = relative_path.trim_start_matches('/');
+                if rel.is_empty() {
+                    full_path.clone()
+                } else {
+                    let mut path = std::path::PathBuf::from(upload_dir);
+                    path.push(rel);
+                    path
+                }
+            } else {
+                full_path.clone()
+            };
+
+            if !delete_target.exists() {
+                self.send_error(token, 404);
+            } else if delete_target.is_dir() {
+                self.send_error(token, 403);
+            } else {
+                match std::fs::remove_file(&delete_target) {
+                    Ok(_) => self.send_text_response(token, 200, "Deleted", "text/plain"),
+                    Err(_) => self.send_error(token, 500),
+                }
+            }
+            return;
+        }
+
         // --- 6. DIRECTORY HANDLING ---
         if full_path.is_dir() {
             if let Some(index_file) = &route.index {
                 full_path.push(index_file);
             } else if route.autoindex {
-                self.send_error(token, 501);
+                let listing = self.build_autoindex_listing(&path_only, &full_path);
+                self.send_text_response(token, 200, &listing, "text/html");
                 return;
             } else {
                 self.send_error(token, 403);
@@ -435,7 +485,7 @@ impl Server {
         let mut body = format!(
             "<html><head><title>{} {}</title></head>\
         <body style='font-family:sans-serif; text-align:center; padding-top:50px;'>\
-        <h1>{} {}</h1><hr><p>Localhost_RS Server</p></body></html>",
+        <h1>{} {}</h1></body></html>",
             code,
             status_text,
             code,
@@ -496,7 +546,10 @@ impl Server {
         body: Vec<u8>,
         content_type: &str
     ) {
-        let headers = vec![("Content-Type".to_string(), content_type.to_string())];
+        let mut headers = vec![("Content-Type".to_string(), content_type.to_string())];
+        if let Some(conn) = self.connections.get_mut(&token) {
+            headers.append(&mut conn.response_headers);
+        }
         let response = Self::build_http_response(
             status_code,
             Self::reason_phrase(status_code),
@@ -540,6 +593,8 @@ impl Server {
         for t in to_remove {
             self.close_connection(t);
         }
+
+        self.sessions.retain(|_, last_seen| now.duration_since(*last_seen) <= timeout);
     }
 
     fn check_cgi_timeouts(&mut self) {
@@ -618,10 +673,7 @@ impl Server {
         body: &[u8],
         env_vars: std::collections::HashMap<String, String>
     ) -> Result<(), String> {
-        let mut child = spawn_cgi_process(script_path, interpreter, body, env_vars)?;
-        let stdout = child.stdout.take().ok_or("CGI stdout not available")?;
-
-        Self::set_nonblocking_fd(stdout.as_raw_fd())?;
+        let (child, stdout) = spawn_cgi_process(script_path, interpreter, body, env_vars)?;
 
         let io_token = Token(self.next_token);
         self.next_token += 1;
@@ -708,7 +760,10 @@ impl Server {
             if let Some(mut pending) = self.remove_pending_cgi(client_token) {
                 let _ = pending.child.wait();
                 if self.connections.contains_key(&client_token) {
-                    let response_bytes = Self::build_cgi_response(&pending.output);
+                    let response_bytes = self.apply_connection_headers_to_raw_response(
+                        client_token,
+                        Self::build_cgi_response(&pending.output)
+                    );
                     self.finalize_response(client_token, response_bytes);
                 }
             }
@@ -748,19 +803,6 @@ impl Server {
             .registry()
             .deregister(&mut source)
             .map_err(|e| e.to_string())
-    }
-
-    fn set_nonblocking_fd(raw_fd: std::os::fd::RawFd) -> Result<(), String> {
-        let flags = unsafe { libc::fcntl(raw_fd, libc::F_GETFL) };
-        if flags < 0 {
-            return Err(format!("fcntl(F_GETFL) failed: {}", io::Error::last_os_error()));
-        }
-
-        if (unsafe { libc::fcntl(raw_fd, libc::F_SETFL, flags | libc::O_NONBLOCK) }) < 0 {
-            return Err(format!("fcntl(F_SETFL) failed: {}", io::Error::last_os_error()));
-        }
-
-        Ok(())
     }
 
     fn find_header_end(buf: &[u8]) -> Option<usize> {
@@ -810,7 +852,11 @@ impl Server {
             }
         }
 
-        "upload.bin".to_string()
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        format!("upload-{}.bin", ts)
     }
 
     fn extract_filename_from_disposition(disposition: &str) -> Option<String> {
@@ -1002,7 +1048,7 @@ impl Server {
             header_lines.push_str(&format!("Content-Length: {}\r\n", body.len()));
         }
 
-        header_lines.push_str("Server: Localhost_RS\r\n");
+        header_lines.push_str("Server: LocalServer\r\n");
         header_lines.push_str(
             if close_connection {
                 "Connection: close\r\n"
@@ -1025,6 +1071,7 @@ impl Server {
         match status_code {
             200 => "OK",
             201 => "Created",
+            301 => "Moved Permanently",
             400 => "Bad Request",
             403 => "Forbidden",
             404 => "Not Found",
@@ -1035,6 +1082,151 @@ impl Server {
             504 => "Gateway Timeout",
             _ => "Internal Server Error",
         }
+    }
+
+    fn select_server_for_request(
+        &self,
+        default_idx: usize,
+        headers: &std::collections::HashMap<String, String>
+    ) -> usize {
+        let host_header = match headers.get("host") {
+            Some(h) => h,
+            None => {
+                return default_idx;
+            }
+        };
+
+        let host_name = host_header.split(':').next().unwrap_or(host_header).trim();
+        let default_cfg = &self.config.servers[default_idx];
+
+        for (idx, cfg) in self.config.servers.iter().enumerate() {
+            if cfg.host == default_cfg.host && cfg.port == default_cfg.port {
+                if
+                    cfg.server_name.eq_ignore_ascii_case(host_name) ||
+                    cfg.host.eq_ignore_ascii_case(host_name)
+                {
+                    return idx;
+                }
+            }
+        }
+
+        default_idx
+    }
+
+    fn send_redirect_response(&mut self, token: Token, location: &str, status_code: u16) {
+        let mut headers = vec![("Location".to_string(), location.to_string())];
+        if let Some(conn) = self.connections.get_mut(&token) {
+            headers.append(&mut conn.response_headers);
+        }
+
+        let response = Self::build_http_response(
+            status_code,
+            Self::reason_phrase(status_code),
+            headers,
+            &[],
+            true
+        );
+        self.finalize_response(token, response);
+    }
+
+    fn build_autoindex_listing(&self, request_path: &str, dir_path: &std::path::Path) -> String {
+        let mut items: Vec<String> = Vec::new();
+
+        if let Ok(entries) = std::fs::read_dir(dir_path) {
+            for entry in entries.flatten() {
+                if let Some(name) = entry.file_name().to_str() {
+                    let suffix = if entry.path().is_dir() { "/" } else { "" };
+                    let base = request_path.trim_end_matches('/');
+                    let href = if base.is_empty() {
+                        format!("/{}{}", name, suffix)
+                    } else {
+                        format!("{}/{}{}", base, name, suffix)
+                    };
+                    items.push(format!("<li><a href=\"{}\">{}{}</a></li>", href, name, suffix));
+                }
+            }
+        }
+
+        items.sort();
+        format!(
+            "<html><head><title>Index of {}</title></head><body><h1>Index of {}</h1><ul>{}</ul></body></html>",
+            request_path,
+            request_path,
+            items.join("")
+        )
+    }
+
+    fn attach_session_cookie(
+        &mut self,
+        token: Token,
+        headers: &std::collections::HashMap<String, String>
+    ) {
+        if let Some(sid) = headers.get("cookie").and_then(|v| Self::extract_session_id(v.as_str())) {
+            self.sessions.insert(sid, Instant::now());
+            return;
+        }
+
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let sid = format!("s{}-{}", self.next_session_id, now_ms);
+        self.next_session_id += 1;
+        self.sessions.insert(sid.clone(), Instant::now());
+
+        if let Some(conn) = self.connections.get_mut(&token) {
+            conn.response_headers.push((
+                "Set-Cookie".to_string(),
+                format!("SESSION_ID={}; Path=/; HttpOnly", sid),
+            ));
+        }
+    }
+
+    fn extract_session_id(cookie_header: &str) -> Option<String> {
+        for part in cookie_header.split(';') {
+            let kv = part.trim();
+            if let Some(value) = kv.strip_prefix("SESSION_ID=") {
+                let clean = value.trim();
+                if !clean.is_empty() {
+                    return Some(clean.to_string());
+                }
+            }
+        }
+        None
+    }
+
+    fn apply_connection_headers_to_raw_response(
+        &mut self,
+        token: Token,
+        response_bytes: Vec<u8>
+    ) -> Vec<u8> {
+        let extra_headers = match self.connections.get_mut(&token) {
+            Some(conn) => std::mem::take(&mut conn.response_headers),
+            None => Vec::new(),
+        };
+
+        if extra_headers.is_empty() {
+            return response_bytes;
+        }
+
+        let split = match response_bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+            Some(pos) => pos,
+            None => {
+                return response_bytes;
+            }
+        };
+
+        let mut out = Vec::with_capacity(response_bytes.len() + 128);
+        out.extend_from_slice(&response_bytes[..split]);
+        out.extend_from_slice(b"\r\n");
+
+        for (key, value) in extra_headers {
+            out.extend_from_slice(format!("{}: {}\r\n", key, value).as_bytes());
+        }
+
+        out.extend_from_slice(b"\r\n");
+        out.extend_from_slice(&response_bytes[split + 4..]);
+        out
     }
 
     fn handle_multipart_upload(

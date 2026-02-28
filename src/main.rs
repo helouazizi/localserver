@@ -6,8 +6,6 @@ mod handlers;
 use crate::server::Server;
 
 fn main() {
-    
-
     let cfg = match config::parse_config("config.yaml") {
         Ok(c) => c,
         Err(e) => {
@@ -25,4 +23,3 @@ fn main() {
 
     server.run();
 }
-

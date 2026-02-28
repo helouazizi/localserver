@@ -33,6 +33,8 @@ pub fn parse_config(path: &str) -> Result<Config, String> {
             0 => {
                 if key == "max_server_size" {
                     config.max_server_size = value.parse().unwrap_or(10485760);
+                } else if key == "timeout_seconds" {
+                    config.timeout_seconds = value.parse().unwrap_or(30);
                 }
                 continue; // "servers:" is also at indent 0
             }
